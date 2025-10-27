@@ -18,6 +18,8 @@ interface LineProgress {
     score: number
     incorrectWords: Array<{ word: string; reason: string }>
     correctWords: string[]
+    recognizedText?: string
+    referenceText?: string
   }
 }
 
@@ -29,13 +31,39 @@ interface ShlokaProgress {
   completedLines: number
 }
 
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000"
+const USER_ID = "guest" // replace with your auth user id if available
+const BASE_XP = 20
+
+function normalizeIAST(s?: string) {
+  if (!s) return ""
+  return s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // strip diacritics
+    .replace(/[^a-z\s\-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function computeFallbackCorrectWords(recognized?: string, reference?: string) {
+  const a = normalizeIAST(recognized).split(" ").filter(Boolean)
+  const b = normalizeIAST(reference).split(" ").filter(Boolean)
+  const minLen = Math.min(a.length, b.length)
+  const out: string[] = []
+  for (let i = 0; i < minLen; i++) {
+    if (a[i] === b[i]) out.push(b[i])
+  }
+  return Array.from(new Set(out))
+}
+
 export default function RecitationModule() {
   const [shlokas, setShlokas] = useState<ShlokaProgress[]>(() => {
     return transcriptData
       .filter((item) => item.shloka > 0)
       .map((item) => ({
         shlokaNumber: item.shloka,
-        lines: item.lines.map((line) => ({
+        lines: item.lines.map((line: any) => ({
           lineIndex: line.line_index,
           translit: line.translit,
           raw: line.raw,
@@ -52,25 +80,28 @@ export default function RecitationModule() {
   })
 
   const [selectedShloka, setSelectedShloka] = useState(1)
-  const [totalXP, setTotalXP] = useState(20)
+  const [totalXP, setTotalXP] = useState(BASE_XP)
   const [badges, setBadges] = useState(0)
   const [chapterProgress, setChapterProgress] = useState(0)
   const [showMasteryAnimation, setShowMasteryAnimation] = useState(false)
   const [micPermissionPrompted, setMicPermissionPrompted] = useState<Set<string>>(new Set())
+
+  const [activeLineKey, setActiveLineKey] = useState<string | null>(null)
+  const [isRecording, setIsRecording] = useState(false)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
+
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
+  const streamRef = useRef<MediaStream | null>(null)
 
   const currentShloka = shlokas.find((s) => s.shlokaNumber === selectedShloka)
-  const masteredShlokas = shlokas.filter((s) => s.mastered).length
-  const progressPercentage = (masteredShlokas / shlokas.length) * 100
 
   const requestMicrophoneAccess = async (lineKey: string) => {
     if (micPermissionPrompted.has(lineKey)) return true
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      stream.getTracks().forEach((track) => track.stop())
+      stream.getTracks().forEach((t) => t.stop())
       setMicPermissionPrompted((prev) => new Set([...prev, lineKey]))
       return true
     } catch (error) {
@@ -80,113 +111,184 @@ export default function RecitationModule() {
     }
   }
 
-  const analyzePronunciation = async (lineKey: string) => {
+  const startRecording = async (lineKey: string) => {
     const hasPermission = await requestMicrophoneAccess(lineKey)
     if (!hasPermission) return
 
-    if (audioChunksRef.current.length === 0) {
-      alert("Please record audio first before analyzing.")
-      return
-    }
+    try {
+      if (!("MediaRecorder" in window)) {
+        alert("Recording is not supported in this browser.")
+        return
+      }
 
+      const mimeType =
+        (window as any).MediaRecorder.isTypeSupported?.("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : "audio/webm"
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+      audioChunksRef.current = []
+
+      const mr = new MediaRecorder(stream, { mimeType })
+      mediaRecorderRef.current = mr
+
+      mr.ondataavailable = (e: BlobEvent) => {
+        if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data)
+      }
+
+      mr.onstop = async () => {
+        // stop tracks to free mic
+        streamRef.current?.getTracks().forEach((t) => t.stop())
+        streamRef.current = null
+
+        // Analyze after stop
+        const blob = new Blob(audioChunksRef.current, { type: "audio/webm" })
+        await analyzePronunciation(lineKey, blob)
+        setActiveLineKey(null)
+      }
+
+      mr.start()
+      setActiveLineKey(lineKey)
+      setIsRecording(true)
+    } catch (err) {
+      console.error("[v0] Failed to start recording:", err)
+      alert("Could not start recording. Please try again.")
+    }
+  }
+
+  const stopRecording = () => {
+    if (!isRecording || !mediaRecorderRef.current) return
+    setIsRecording(false)
+    try {
+      mediaRecorderRef.current.stop()
+    } catch (err) {
+      console.error("[v0] Failed to stop recorder:", err)
+    }
+  }
+
+  const analyzePronunciation = async (lineKey: string, audioBlob: Blob) => {
     setIsAnalyzing(true)
 
     try {
-      // Replace this URL with your actual backend endpoint
-      // Expected endpoint: POST /api/analyze-pronunciation
-      // Request body: { audio: Blob, transliteration: string, sanskrit: string }
-      // Expected response: { score: number, incorrectWords: Array<{word, reason}>, correctWords: string[] }
-
-      const audioBlob = new Blob(audioChunksRef.current, { type: "audio/wav" })
-      const formData = new FormData()
-      formData.append("audio", audioBlob)
-
       const [shlokaNum, lineIdx] = lineKey.split("-").map(Number)
-      const line = currentShloka?.lines.find((l) => l.lineIndex === lineIdx)
 
-      if (line) {
-        formData.append("transliteration", line.translit)
-        formData.append("sanskrit", line.raw)
+      // Build form data for backend (includes shloka_no and line_no)
+      const formData = new FormData()
+      formData.append("audio", audioBlob, `rec_${shlokaNum}_${lineIdx}.webm`)
+      formData.append("user_id", USER_ID)
+      formData.append("shloka_no", String(shlokaNum))
+      formData.append("line_no", String(lineIdx))
 
-        // BACKEND INTEGRATION POINT 1: Pronunciation Analysis
-        // Uncomment and update the endpoint URL below:
-        /*
-        const response = await fetch("/api/analyze-pronunciation", {
-          method: "POST",
-          body: formData,
-        })
+      // Backend: Whisper small STT + Gemini reference + scoring + word tracking
+      const response = await fetch(`${API_BASE}/api/guided/submit`, {
+        method: "POST",
+        body: formData,
+      })
 
-        if (!response.ok) throw new Error("Analysis failed")
-        const result = await response.json()
-        const accuracy = result.score
-        const feedback = result
-        */
-
-        // For now, using mock data - replace with actual backend call above
-        const accuracy = Math.floor(Math.random() * 40) + 60
-        const feedback = {
-          score: accuracy,
-          incorrectWords: [
-            { word: "भ", reason: "Pronunciation too soft, needs more emphasis" },
-            { word: "वान्", reason: "Nasal sound not clear enough" },
-          ],
-          correctWords: ["श्री", "उ", "वाच"],
-        }
-
-        const isMastered = accuracy >= 70
-
-        setShlokas((prevShlokas) =>
-          prevShlokas.map((shloka) => {
-            if (shloka.shlokaNumber === shlokaNum) {
-              const updatedLines = shloka.lines.map((l) => {
-                if (l.lineIndex === lineIdx) {
-                  const wasNotMastered = !l.mastered
-                  const newMastered = isMastered
-
-                  if (wasNotMastered && newMastered) {
-                    setTotalXP((prev) => prev + 5)
-                  }
-
-                  return {
-                    ...l,
-                    score: accuracy,
-                    attempts: l.attempts + 1,
-                    mastered: newMastered,
-                    feedback,
-                  }
-                }
-                return l
-              })
-
-              const completedLines = updatedLines.filter((l) => l.mastered).length
-              const allLinesMastered = completedLines === updatedLines.length
-              const newTotalScore = Math.round(updatedLines.reduce((sum, l) => sum + l.score, 0) / updatedLines.length)
-
-              if (allLinesMastered && !shloka.mastered) {
-                setBadges((prev) => {
-                  const newBadgeCount = prev + 1
-                  setChapterProgress((prevProgress) => Math.min(prevProgress + 5, 100))
-
-                  if (newBadgeCount === 20) {
-                    setShowMasteryAnimation(true)
-                    setTimeout(() => setShowMasteryAnimation(false), 5000)
-                  }
-                  return newBadgeCount
-                })
-              }
-
-              return {
-                ...shloka,
-                lines: updatedLines,
-                totalScore: newTotalScore,
-                mastered: allLinesMastered,
-                completedLines,
-              }
-            }
-            return shloka
-          }),
-        )
+      if (!response.ok) {
+        const errText = await response.text().catch(() => "unknown error")
+        throw new Error(`Analysis failed: ${response.status} ${errText}`)
       }
+
+      const result = await response.json()
+
+      // Robustly read fields from backend
+      const accuracy = typeof result.accuracy === "number" ? result.accuracy : Number(result.score ?? 0)
+      const threshold = Number(result.pass_threshold ?? 70)
+      const lineCompleted = Boolean(result.line_completed)
+
+      // Wrong words (various possible keys)
+      const rawMistakes =
+        result.mistakes ||
+        result.incorrect_words ||
+        result.wrong_words ||
+        []
+
+      const incorrectWords = Array.isArray(rawMistakes)
+        ? rawMistakes.map((m: any) => {
+            const heard = m.heard ?? m.user ?? m.word ?? ""
+            const correct = m.should_be ?? m.correct ?? ""
+            let reason = ""
+            if (heard && correct) reason = `should be: ${correct}`
+            else if (!heard && correct) reason = `missing: ${correct}`
+            else if (heard && !correct) reason = "extra word"
+            return { word: heard || correct, reason }
+          })
+        : []
+
+      // Correct words (prefer backend; fallback to local alignment)
+      const correctWordsFromBackend =
+        result.correct_words ||
+        result.matches ||
+        []
+
+      const recognizedText = result.recognized_text || ""
+      const referenceText = result.reference_text || ""
+
+      const correctWords: string[] =
+        Array.isArray(correctWordsFromBackend) && correctWordsFromBackend.length > 0
+          ? correctWordsFromBackend
+          : computeFallbackCorrectWords(recognizedText, referenceText)
+
+      // Update state
+      setShlokas((prev) =>
+        prev.map((shloka) => {
+          if (shloka.shlokaNumber !== shlokaNum) return shloka
+
+          const updatedLines = shloka.lines.map((l) => {
+            if (l.lineIndex !== lineIdx) return l
+
+            const newScore = lineCompleted ? 100 : Math.round(Number(accuracy) || 0)
+            const blobUrl = URL.createObjectURL(audioBlob)
+
+            return {
+              ...l,
+              score: newScore,
+              attempts: typeof result.attempts === "number" ? result.attempts : l.attempts + 1,
+              mastered: lineCompleted || (Number(accuracy) >= threshold),
+              recordingUrl: blobUrl,
+              feedback: {
+                score: newScore,
+                incorrectWords,
+                correctWords,
+                recognizedText,
+                referenceText,
+              },
+            }
+          })
+
+          const completedLines = updatedLines.filter((x) => x.mastered).length
+          const allLinesMastered =
+            result.shloka_progress?.percent === 100 ||
+            completedLines === updatedLines.length
+
+          const avgScore =
+            updatedLines.reduce((s, x) => s + (x.score || 0), 0) /
+            (updatedLines.length || 1)
+
+          return {
+            ...shloka,
+            lines: updatedLines,
+            totalScore: Math.round(avgScore),
+            mastered: allLinesMastered,
+            completedLines:
+              Number(result.shloka_progress?.lines_completed ?? completedLines),
+          }
+        })
+      )
+
+      // Update top stats from backend totals
+      setTotalXP(BASE_XP + Number(result.totals?.xp_total ?? 0))
+      const newBadges = Number(result.totals?.shlokas_mastered ?? 0)
+      setBadges((prev) => {
+        if (currentShloka && newBadges === shlokas.length && newBadges !== prev) {
+          setShowMasteryAnimation(true)
+          setTimeout(() => setShowMasteryAnimation(false), 5000)
+        }
+        return newBadges
+      })
+      setChapterProgress(Number(result.totals?.chapter_progress_percent ?? 0))
     } catch (error) {
       console.error("[v0] Error analyzing pronunciation:", error)
       alert("Error analyzing pronunciation. Please try again.")
@@ -194,6 +296,8 @@ export default function RecitationModule() {
       setIsAnalyzing(false)
     }
   }
+
+  const masteredShlokas = shlokas.filter((s) => s.mastered).length
 
   return (
     <div className="space-y-8">
@@ -203,15 +307,15 @@ export default function RecitationModule() {
           <div className="text-center">
             <div className="text-4xl font-bold text-purple-600 mb-2">{totalXP}</div>
             <div className="text-gray-700 font-semibold">Total XP Earned</div>
-            <div className="text-xs text-gray-600 mt-1">Base: 20 XP + 5 per line</div>
+            <div className="text-xs text-gray-600 mt-1">Base: {BASE_XP} XP + 5 per line</div>
           </div>
         </Card>
         <Card className="bg-gradient-to-br from-green-100 to-green-50 border-0 p-6">
           <div className="text-center">
-            <div className="text-4xl font-bold text-green-600 mb-2">{masteredShlokas}</div>
+            <div className="text-4xl font-bold text-green-600 mb-2">{badges}</div>
             <div className="text-gray-700 font-semibold">Shlokas Mastered</div>
             <div className="text-xs text-gray-600 mt-1">
-              {masteredShlokas} of {shlokas.length} mastered
+              {badges} of {shlokas.length} mastered
             </div>
           </div>
         </Card>
@@ -233,8 +337,8 @@ export default function RecitationModule() {
       <Card className="bg-white border-2 border-gray-200 p-6">
         <div className="mb-2 flex justify-between items-center">
           <h3 className="text-lg font-bold text-gray-900">Chapter 15 Progress</h3>
-          <span className="text-sm font-semibold text-gray-600">
-            {masteredShlokas} of {shlokas.length} shlokas mastered
+        <span className="text-sm font-semibold text-gray-600">
+            {badges} of {shlokas.length} shlokas mastered
           </span>
         </div>
         <div className="w-full bg-gray-200 rounded-full h-4 overflow-hidden">
@@ -298,6 +402,8 @@ export default function RecitationModule() {
               <h4 className="font-semibold text-gray-900">Practice Each Line:</h4>
               {currentShloka.lines.map((line) => {
                 const lineKey = `${currentShloka.shlokaNumber}-${line.lineIndex}`
+                const isActiveLine = activeLineKey === lineKey && isRecording
+
                 return (
                   <div key={lineKey} className="bg-white p-4 rounded-lg border border-gray-200">
                     <div className="flex items-start justify-between mb-3">
@@ -322,7 +428,21 @@ export default function RecitationModule() {
 
                     {line.feedback && (
                       <div className="mb-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
-                        <div className="text-sm font-semibold text-gray-900 mb-2">Pronunciation Feedback:</div>
+                        <div className="text-sm font-semibold text-gray-900 mb-2">Pronunciation Feedback</div>
+                        {(line.feedback.recognizedText || line.feedback.referenceText) && (
+                          <div className="mb-2 text-xs">
+                            {line.feedback.referenceText && (
+                              <div className="text-gray-700">
+                                <span className="font-semibold">Reference:</span> {line.feedback.referenceText}
+                              </div>
+                            )}
+                            {line.feedback.recognizedText && (
+                              <div className="text-gray-700">
+                                <span className="font-semibold">You said:</span> {line.feedback.recognizedText}
+                              </div>
+                            )}
+                          </div>
+                        )}
                         {line.feedback.incorrectWords.length > 0 && (
                           <div className="mb-2">
                             <div className="text-xs font-semibold text-red-700 mb-1">Words to improve:</div>
@@ -342,13 +462,24 @@ export default function RecitationModule() {
                       </div>
                     )}
 
-                    <Button
-                      onClick={() => analyzePronunciation(lineKey)}
-                      disabled={line.mastered || isAnalyzing}
-                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      {line.mastered ? "✓ Line Mastered" : isAnalyzing ? "Analyzing..." : "Practice This Line"}
-                    </Button>
+                    {/* Record / Stop flow */}
+                    {!isActiveLine ? (
+                      <Button
+                        onClick={() => startRecording(lineKey)}
+                        disabled={line.mastered || isAnalyzing}
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {line.mastered ? "✓ Line Mastered" : "Practice This Line"}
+                      </Button>
+                    ) : (
+                      <Button
+                        onClick={stopRecording}
+                        disabled={isAnalyzing}
+                        className="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isAnalyzing ? "Analyzing..." : "Stop Recording"}
+                      </Button>
+                    )}
                   </div>
                 )
               })}
